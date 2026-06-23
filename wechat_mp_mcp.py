@@ -162,6 +162,49 @@ def _article_ranking(rep: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [{"pubdate": d, "title": t, "reads": int(r)} for (d, t), r in g.items()]
 
 
+def _article_totals(rep: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """从一份报告取每篇文章的累计阅读（channel=全部），返回 {title: {pubdate, reads}}。"""
+    c = rep["article_channel"]
+    g = c[c["channel"] == "全部"].groupby(["title", "pubdate"])["readers"].sum()
+    out: Dict[str, Dict[str, Any]] = {}
+    for (title, pubdate), reads in g.items():
+        # 同标题若有多个 pubdate（极少），保留阅读更高的那条
+        if title not in out or reads > out[title]["reads"]:
+            out[title] = {"pubdate": str(pubdate), "reads": int(reads)}
+    return out
+
+
+def build_timeseries(folder: str) -> Tuple[Dict[str, Dict[str, Any]], List[str]]:
+    """扫描文件夹内所有导出文件，按文章标题对齐成累计阅读时间序列。
+
+    每份导出的「截止日」取其数据窗口结束日（date_range[1]）。同一截止日的重复文件按阅读取最大值去重。
+    返回 ({title: {pubdate, series:[(date,reads)...]}}, 解析失败文件列表)。
+    """
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(folder)
+    files = [
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if f.lower().endswith((".xls", ".xlsx")) and not f.startswith("~$")
+    ]
+    series: Dict[str, Dict[str, Any]] = {}
+    errors: List[str] = []
+    for fp in files:
+        try:
+            rep = parse_report(fp)
+            as_of = rep["date_range"][1]
+            for title, info in _article_totals(rep).items():
+                node = series.setdefault(title, {"pubdate": info["pubdate"], "points": {}})
+                # 同截止日去重取最大
+                node["points"][as_of] = max(node["points"].get(as_of, 0), info["reads"])
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{os.path.basename(fp)}: {type(e).__name__}: {e}")
+    # points dict → 排序后的 (date, reads) 列表
+    for title, node in series.items():
+        node["series"] = sorted(node.pop("points").items())
+    return series, errors
+
+
 def forecast_milestone(
     observations: List[Tuple[str, int]],
     milestone: int = 10000,
@@ -329,6 +372,13 @@ class ForecastInput(_Base):
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="markdown / json")
 
 
+class TrackInput(_Base):
+    folder: str = Field(..., description="存放多份不同日期导出文件的文件夹，如 /Users/xlisp/Downloads/mp_exports", min_length=1)
+    milestone: int = Field(default=10000, description="目标阅读量阈值，默认过万", ge=1)
+    title: Optional[str] = Field(default=None, description="只看某一篇文章；留空则对所有文章逐篇预测")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="markdown / json")
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 工具
 # ──────────────────────────────────────────────────────────────────────────
@@ -431,6 +481,71 @@ async def wechat_forecast_milestone(params: ForecastInput) -> str:
         res["watch_metric"],
     ]
     return "\n".join(out)
+
+
+@mcp.tool(name="wechat_track_milestone", annotations={"title": "文件夹追踪·逐篇过万预测", "readOnlyHint": True,
+          "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
+async def wechat_track_milestone(params: TrackInput) -> str:
+    """指向一个存放多份不同日期导出文件的文件夹，自动按文章对齐成累计阅读时间序列并逐篇预测过万。
+
+    免去手动输入快照：把每天/每隔几天导出的报告丢进同一文件夹即可。每份导出的「截止日」取其数据
+    窗口结束日，文章阅读数视为截至该日的累计值（前提：导出窗口起始日 ≤ 文章发表日，否则为窗口内值）。
+
+    Args:
+        params.folder: 含多份 xls/xlsx 导出的文件夹路径。
+        params.milestone: 目标阈值，默认 10000。
+        params.title: 可选，只追踪某一篇。
+    Returns: 每篇的快照序列 + 预测（当前阅读、衰减/飞轮天花板、过万概率、盯哪个指标）。
+    """
+    try:
+        series, errors = build_timeseries(params.folder)
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {type(e).__name__}: {e}"
+    if not series:
+        msg = "Error: 文件夹内未解析到任何文章数据。请放入公众号后台导出的「数据趋势」xls/xlsx。"
+        return msg + ("\n失败文件：\n- " + "\n- ".join(errors) if errors else "")
+
+    items = series.items()
+    if params.title:
+        items = [(t, n) for t, n in items if t == params.title]
+        if not items:
+            return f"Error: 未找到文章「{params.title}」，请核对标题。"
+
+    results = []
+    for title, node in items:
+        s = node["series"]
+        cur = s[-1][1] if s else 0
+        entry: Dict[str, Any] = {"title": title, "pubdate": node["pubdate"],
+                                 "snapshots": len(s), "current_reads": cur, "series": s}
+        if len(s) >= 2:
+            entry["forecast"] = forecast_milestone(s, milestone=params.milestone)
+        else:
+            entry["forecast"] = {"note": "仅 1 个快照，需至少两份不同日期的导出才能预测增速"}
+        results.append(entry)
+    results.sort(key=lambda x: x["current_reads"], reverse=True)
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps({"articles": results, "parse_errors": errors}, ensure_ascii=False, indent=2)
+
+    lines = [f"## 文件夹追踪（{len(results)} 篇 · 目标 {params.milestone:,}）"]
+    for x in results:
+        seq = " → ".join(f"{d}:{r:,}" for d, r in x["series"])
+        lines.append(f"\n### {x['current_reads']:,} · {x['title']}（{x['pubdate']}，{x['snapshots']} 个快照）")
+        lines.append(f"- 序列：{seq}")
+        f = x["forecast"]
+        if "note" in f:
+            lines.append(f"- {f['note']}")
+        elif f.get("verdict") == "已达成":
+            lines.append(f"- ✅ 已超过 {f['milestone']:,}")
+        else:
+            d = f["scenarios"]["decay"]
+            lines.append(
+                f"- 日增 {f['latest_daily_gain']:,}｜r≈{f['decay_ratio_r']}｜自然天花板≈{d['natural_ceiling']:,}"
+                f"｜**过万概率 {f['probability']*100:.0f}%（{f['probability_band']}）**"
+            )
+    if errors:
+        lines.append("\n> 跳过的文件：" + "；".join(errors))
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
